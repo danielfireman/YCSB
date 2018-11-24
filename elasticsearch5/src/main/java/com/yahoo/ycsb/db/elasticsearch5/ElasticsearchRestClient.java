@@ -22,6 +22,16 @@ import com.yahoo.ycsb.DB;
 import com.yahoo.ycsb.DBException;
 import com.yahoo.ycsb.Status;
 import com.yahoo.ycsb.StringByteIterator;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+import java.util.Set;
+import java.util.Vector;
 import org.apache.http.Header;
 import org.apache.http.HttpEntity;
 import org.apache.http.HttpHost;
@@ -35,16 +45,6 @@ import org.elasticsearch.client.Response;
 import org.elasticsearch.client.RestClient;
 import org.elasticsearch.common.xcontent.XContentBuilder;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Properties;
-import java.util.Set;
-import java.util.Vector;
 
 import static com.yahoo.ycsb.db.elasticsearch5.Elasticsearch5.KEY;
 import static com.yahoo.ycsb.db.elasticsearch5.Elasticsearch5.parseIntegerProperty;
@@ -191,10 +191,9 @@ public class ElasticsearchRestClient extends DB {
       final Map<String, String> data = StringByteIterator.getStringMap(values);
       data.put(KEY, key);
 
-      final Response response = restClient.performRequest(
+      final Response response = retriableOp(
           "POST",
           "/" + indexKey + "/" + table + "/",
-          Collections.<String, String>emptyMap(),
           new NStringEntity(new ObjectMapper().writeValueAsString(data), ContentType.APPLICATION_JSON));
 
       if (response.getStatusLine().getStatusCode() != HttpStatus.SC_CREATED) {
@@ -233,8 +232,10 @@ public class ElasticsearchRestClient extends DB {
       }
       @SuppressWarnings("unchecked") final Map<String, Object> hit =
               (Map<String, Object>)((List<Object>)hits.get("hits")).get(0);
-      final Response deleteResponse =
-              restClient.performRequest("DELETE", "/" + indexKey + "/" + table + "/" + hit.get("_id"));
+      final Response deleteResponse = retriableOp(
+              "DELETE",
+              "/" + indexKey + "/" + table + "/" + hit.get("_id"),
+              null);
       if (deleteResponse.getStatusLine().getStatusCode() != HttpStatus.SC_OK) {
         return Status.ERROR;
       }
@@ -319,11 +320,10 @@ public class ElasticsearchRestClient extends DB {
       for (final Map.Entry<String, String> entry : StringByteIterator.getStringMap(values).entrySet()) {
         source.put(entry.getKey(), entry.getValue());
       }
-      final Map<String, String> params = emptyMap();
-      final Response response = restClient.performRequest(
+
+      final Response response = retriableOp(
               "PUT",
               "/" + indexKey + "/" + table + "/" + hit.get("_id"),
-              params,
               new NStringEntity(new ObjectMapper().writeValueAsString(source), ContentType.APPLICATION_JSON));
       if (response.getStatusLine().getStatusCode() != HttpStatus.SC_OK) {
         return Status.ERROR;
@@ -407,7 +407,7 @@ public class ElasticsearchRestClient extends DB {
         }
       }
       if (refresh) {
-        restClient.performRequest("POST", "/" + indexKey + "/_refresh");
+        retriableOp("POST", "/" + indexKey + "/_refresh", null);
       }
     }
   }
@@ -427,10 +427,9 @@ public class ElasticsearchRestClient extends DB {
 
   private Response search(final String table, final XContentBuilder builder) throws IOException {
     refreshIfNeeded();
-    final Map<String, String> params = emptyMap();
     final StringEntity entity = new StringEntity(builder.string());
     final Header header = new BasicHeader("content-type", ContentType.APPLICATION_JSON.toString());
-    return restClient.performRequest("GET", "/" + indexKey + "/" + table + "/_search", params, entity, header);
+    return retriableOp("GET", "/" + indexKey + "/" + table + "/_search", entity, header);
   }
 
   private Map<String, Object> map(final Response response) throws IOException {
@@ -441,4 +440,38 @@ public class ElasticsearchRestClient extends DB {
     }
   }
 
+  private static final Map<String, String> IGNORE_MAP = Collections.singletonMap("ignore", "503");
+  private Response retriableOp(String method, String endpoint, HttpEntity body, Header... header){
+    int numOfRetries = 0;
+    do {
+      try {
+        return restClient.performRequest(
+          method,
+          endpoint,
+          IGNORE_MAP,
+          body, 
+          header);
+      } catch (Exception e) {
+        // pass
+      }
+      // Retry if configured. Without retrying, the load process will fail
+      // even if one single insertion fails. User can optionally configure
+      // an insertion retry limit (default is 0) to enable retry.
+      if (++numOfRetries <= 3) {
+        System.err.println("Retrying, retry count: " + numOfRetries);
+        try {
+          // Sleep for a random number between [0.8, 1.2)*insertionRetryInterval.
+          //int sleepTime = (int) (1000 * 0.02 * (0.8 + 0.4 * Math.random()));
+          Thread.sleep(10);
+        } catch (InterruptedException e) {
+          break;
+        }
+      } else {
+        System.err.println("\nError inserting, not retrying any more. number of attempts: " + numOfRetries +
+            "Insertion Retry Limit: " + 3 + "\n");
+        break;
+      }
+    } while (true);
+    return null;
+  }
 }
